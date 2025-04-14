@@ -1,11 +1,8 @@
 use std::{
-    env,
-    fs,
-    io, io::Write,
-    os::{fd::AsRawFd, linux::fs::MetadataExt},
-    path::Path,
+    env, fs, io::{self, BufRead, Write}, os::linux::fs::MetadataExt
     };
-use libc::{sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE, fsync};
+use libc::{sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE};
+use uuid::Uuid;
 
 const SWAP_SIGNATURE: &[u8] = b"SWAPSPACE2";
 const SWAP_UUID_LENGTH: usize = 16;
@@ -15,18 +12,31 @@ const SWAP_VERSION: u8 = 1;
 struct SwapHdr {
     bootbits: [u8; 1024],
     version: u8,
-    last_page: u32,
+    last_page: u64,
     nr_badpages: u32,
     uuid: [u8; SWAP_UUID_LENGTH],
-    volume_name: [char; 16],
+    volume_name: [u8; 16],
     padding: [u32; 117],
     badpages: [u32; 1]
 }
 
+/*
+struct MkSwap {
+    swap_hdr: SwapHdr,
+    sigpage: Box<[u8]>,
+    devname: String,
+    devstat: Metadata,
+    fd: fs::File,
+    pages: u128,
+    pagesize: i64,
+    filesize: u128,
+}
+*/
+
 
 
 fn main() -> io::Result<()> {
-    
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: {} device", args[0]);
@@ -34,57 +44,138 @@ fn main() -> io::Result<()> {
     }
 
 
-    let mut pagesize: i64 =  unsafe { sysconf(_SC_PAGESIZE)};
+
+    let devstr = format!("{}", args[1]);
+    let devname = devstr.strip_prefix("/dev/").unwrap_or(&devstr);
+    println!("{devname}\n");
+
+
+    let dev = std::path::Path::new(devstr.as_str());
+    
+/*
+    let mut fd = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true).truncate(false)
+                    .append(false).open(dev)?;
+                */
+
+    // if S_ISBLK(dev) then
+    // let fs = unsafe { open(devstr.as_ptr() as *const i8, O_RDWR | O_EXCL)  };
+    // let mut fd = unsafe { fs::File::from_raw_fd(fs)};
+    // else: basic open
+    
+
+    //swapsize is different!! should be same as devsize? (swapon)
+    let mut fd = fs::File::options().create(true)
+                                    .read(true)
+                                    .write(true)
+                                    .truncate(false)
+                                    .append(false)
+                                    .open(dev)?;
+    //let mut fd = fs::File::create(dev)?;
+    let stat = fd.metadata()?;
+
+    let devsize: u128;
+  
+    /*Read block size from sys/class */
+    if stat.st_mode() == 25008 {
+        let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
+        //let mut devszstr = String::new();
+        //f_size.read_to_string(&mut devszstr)?;
+        let reader = io::BufReader::new(f_size);
+        let vec: Vec<Result<u128, _>> = reader.lines().map(|v| v.unwrap().parse()).collect();
+        devsize = vec[0].clone().unwrap();
+        //devsize = devszstr.parse().expect("Couldnt convert device size to u128");
+    } else {
+        devsize = (stat.st_size() as u128)/512;
+        assert_eq!(stat.st_size(), stat.len());
+    }
+    
+
+    let mut pagesize: i64 =  unsafe {sysconf(_SC_PAGESIZE)};
     if pagesize <= 0 {
         pagesize = unsafe {sysconf(_SC_PAGE_SIZE)};
         if pagesize <= 0 {
-            panic!("can't determine pagesize\n");
+            pagesize = stat.st_blksize() as i64;
+            if pagesize <= 0 {
+                pagesize = 4096;
+            }
         }
     }
-
-
-    let devstr = format!("{}", args[1]);
-    let dev = Path::new(devstr.as_str());
+    //4194304
     
 
-    let mut fd = fs::OpenOptions::new()
-                    .write(true)
-                    .create(false).truncate(false)
-                    .append(false).open(dev)?;
-    let stat = fd.metadata()?;
+    println!("{:?}", stat.permissions());
+    println!("{:?}\nlength: {:?}\nst_size(): {:?}\nblocks: {:?}\nblksize: {:?}\n{:?}\n{:?}\nmode: {:?}\ndevsize: {}", 
+    stat.file_type(), stat.len(), stat.st_size(), stat.st_blocks(), stat.st_blksize(), stat.st_ino(), stat.st_rdev(), stat.st_mode(), devsize);
 
-    let pages = stat.st_size() / pagesize as u64;
- 
+    
+    assert!(pagesize > 0);
+    assert!(devsize > 0);
+
+    /* REMOVE STAT.ST_SIZE!! 
+     * -> read block devices size from /sys/class/block/[device]/size (which is size in sectors of 512 bytes) 
+     *  so size = sectors*512     
+     */
+    
+    let pages = (devsize*512) / pagesize as u128;
+
+    assert!(pages > 0);
+    debug_assert_eq!(pages, ((devsize*512)/4096));
+
+    if stat.st_uid() != 0 {
+        println!("{}: {}: insecure file owner {}, fix with: chown 0:0 {}",
+            args[0], args[1], stat.st_uid(), args[1]);
+    }
+
+    if pages < 10 {
+        println!("swap space needs to be at least {}KiB",
+                10 * pagesize / 1024);
+        return Ok(());
+    }
+
+    println!("number of pages: {pages}");
+    println!("last page: {}", pages - 1);
+    //blks / (ctl.pagesize / 1024)
+
     let mut buf= Box::<[u8]>::new_uninit_slice(pagesize.try_into().unwrap());  //new_zeroed_slice in nightly build might be preferrable
-    unsafe {
-        buf.as_mut_ptr().write_bytes(0, 4096); //calloc
-    }
-
-    let swap_hdr: SwapHdr = SwapHdr { bootbits: [0;1024], version: SWAP_VERSION, last_page: (pages as u32)-1,
-         nr_badpages: 0, uuid:[0; 16], volume_name:['0'; 16], padding:[0; 117], badpages:[0; 1]};
     
-    buf[1024].write(swap_hdr.version);
-
-    unsafe { 
-        let lp = buf[1025..1028].align_to_mut::<u32>();
-        lp.1.as_mut_ptr().write(swap_hdr.last_page);
+    unsafe {
+        buf.as_mut_ptr().write_bytes(0, pagesize as usize); //initialize with memset
     }
+    
+    let swap_hdr = buf.as_mut_ptr() as *mut SwapHdr;
+ 
 
+    unsafe {
+        (*swap_hdr).version = SWAP_VERSION;
+
+        (*swap_hdr).last_page = pages as u64- 1; //overflow?
+        /* One possibility is that last_page evaluates as 0 and swapon reads it
+         * (swapon gets the size from casting the header pointer to a swap_header
+         *  struct and reading from it), multiplies by the pagesize, which results in 4096 */
+         /* The failure point is the literal swapon call, which gives the error "Invalid argument" */
+
+        (*swap_hdr).uuid = *Uuid::new_v4().as_bytes();
+        
+    }
+    
+    /* Swap signature */
     let mut pos = 0;
     while pos < SWAP_SIGNATURE.len() {
-        let _ = buf[pos+4086].write(SWAP_SIGNATURE[pos]);
+        /* check the position pos+pagesize-10 */
+        let _ = buf[pos+(pagesize as usize-10)].write(SWAP_SIGNATURE[pos]);
         pos += 1;
     }
 
+
     let buf = unsafe {buf.assume_init()};
-    let _ = fd.write(&buf);
+    //fd.seek(io::SeekFrom::Start(1024))?;
+    fd.write_all(&buf)?;
+    fd.flush()?;
+    fd.sync_all()?;
 
-    unsafe {
-        fsync(fd.as_raw_fd());
-    }
-
-    println!("Setting up swapspace version 1, size = {}KiB", (pages-1) * pagesize as u64 / 1024);
-
+    println!("Setting up swapspace version 1, size = {}KiB", (((pages-1) * pagesize as u128) / 1024));
 
     Ok(())
 }

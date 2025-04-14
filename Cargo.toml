@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.171"
+uuid = { version = "1.16.0", features = ["v4"] }
