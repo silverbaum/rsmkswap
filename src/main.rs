@@ -43,12 +43,9 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-
-
     let devstr = format!("{}", args[1]);
     let devname = devstr.strip_prefix("/dev/").unwrap_or(&devstr);
     println!("{devname}\n");
-
 
     let dev = std::path::Path::new(devstr.as_str());
     
@@ -69,7 +66,7 @@ fn main() -> io::Result<()> {
     let mut fd = fs::File::options().create(true)
                                     .read(true)
                                     .write(true)
-                                    .truncate(false)
+                                    .truncate(true)
                                     .append(false)
                                     .open(dev)?;
     //let mut fd = fs::File::create(dev)?;
@@ -80,12 +77,16 @@ fn main() -> io::Result<()> {
     /*Read block size from sys/class */
     if stat.st_mode() == 25008 {
         let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
+
         //let mut devszstr = String::new();
         //f_size.read_to_string(&mut devszstr)?;
+        //devsize = devszstr.parse().expect("Couldnt convert device size to uint_128");
+
+        //horrendous but it may work, returns size in sectors
         let reader = io::BufReader::new(f_size);
         let vec: Vec<Result<u128, _>> = reader.lines().map(|v| v.unwrap().parse()).collect();
         devsize = vec[0].clone().unwrap();
-        //devsize = devszstr.parse().expect("Couldnt convert device size to u128");
+        
     } else {
         devsize = (stat.st_size() as u128)/512;
         assert_eq!(stat.st_size(), stat.len());
@@ -113,10 +114,6 @@ fn main() -> io::Result<()> {
     assert!(pagesize > 0);
     assert!(devsize > 0);
 
-    /* REMOVE STAT.ST_SIZE!! 
-     * -> read block devices size from /sys/class/block/[device]/size (which is size in sectors of 512 bytes) 
-     *  so size = sectors*512     
-     */
     
     let pages = (devsize*512) / pagesize as u128;
 
@@ -153,7 +150,7 @@ fn main() -> io::Result<()> {
         (*swap_hdr).last_page = pages as u64- 1; //overflow?
         /* One possibility is that last_page evaluates as 0 and swapon reads it
          * (swapon gets the size from casting the header pointer to a swap_header
-         *  struct and reading from it), multiplies by the pagesize, which results in 4096 */
+         *  struct and reading from it), multiplies last_page+1 by the pagesize, which results in 0+1*4096 = 4096*/
          /* The failure point is the literal swapon call, which gives the error "Invalid argument" */
 
         (*swap_hdr).uuid = *Uuid::new_v4().as_bytes();
