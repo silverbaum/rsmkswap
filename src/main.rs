@@ -10,7 +10,8 @@ const SWAP_SIGNATURE_SZ: usize = 10;
 const SWAP_UUID_LENGTH: usize = 16;
 const SWAP_VERSION: u8 = 1;
 
-#[repr(C)]
+
+#[repr(C)] //to ensure proper order/alignment
 struct SwapHeader {
     bootbits: [u8; 1024],
     version: u8,
@@ -95,19 +96,16 @@ fn main() -> io::Result<()> {
     debug_assert_eq!(pages, ((devsize*512)/4096));
 
     
+    //allocate signature page
+    let mut buf = Box::<[u8]>::new_uninit_slice(pagesize as usize);
 
+    unsafe {
+        //initialize the page
+        buf.as_mut_ptr().write_bytes(0, pagesize as usize); 
     
 
-    let mut buf= Box::<[u8]>::new_uninit_slice(pagesize as usize);
-    
-    unsafe {
-        buf.as_mut_ptr().write_bytes(0, pagesize as usize); //initialize buffer
-    }
-
-
-    let swap_hdr = buf.as_mut_ptr() as *mut SwapHeader;
- 
-    unsafe {
+        //fill up swap header identically to C
+        let swap_hdr = buf.as_mut_ptr() as *mut SwapHeader; 
         (*swap_hdr).version = SWAP_VERSION;
         (*swap_hdr).last_page = lastpage as u32;
         (*swap_hdr).uuid = *Uuid::new_v4().as_bytes();
