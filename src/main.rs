@@ -12,7 +12,7 @@ const SWAP_VERSION: u8 = 1;
 struct SwapHdr {
     bootbits: [u8; 1024],
     version: u8,
-    last_page: u64,
+    last_page: u32,
     nr_badpages: u32,
     uuid: [u8; SWAP_UUID_LENGTH],
     volume_name: [u8; 16],
@@ -33,6 +33,7 @@ struct MkSwap {
 }
 */
 
+/* ensure last_page written into right place in memory */
 
 
 fn main() -> io::Result<()> {
@@ -61,18 +62,19 @@ fn main() -> io::Result<()> {
     // let mut fd = unsafe { fs::File::from_raw_fd(fs)};
     // else: basic open
     
+    
 
     //swapsize is different!! should be same as devsize? (swapon)
     let mut fd = fs::File::options().create(true)
                                     .read(true)
                                     .write(true)
-                                    .truncate(true)
+                                    .truncate(false)
                                     .append(false)
                                     .open(dev)?;
     //let mut fd = fs::File::create(dev)?;
     let stat = fd.metadata()?;
 
-    let devsize: u128;
+    let devsize: u32;
   
     /*Read block size from sys/class */
     if stat.st_mode() == 25008 {
@@ -84,11 +86,11 @@ fn main() -> io::Result<()> {
 
         //horrendous but it may work, returns size in sectors
         let reader = io::BufReader::new(f_size);
-        let vec: Vec<Result<u128, _>> = reader.lines().map(|v| v.unwrap().parse()).collect();
+        let vec: Vec<Result<u32, _>> = reader.lines().map(|v| v.unwrap().parse()).collect();
         devsize = vec[0].clone().unwrap();
         
     } else {
-        devsize = (stat.st_size() as u128)/512;
+        devsize = (stat.st_size() as u32)/512;
         assert_eq!(stat.st_size(), stat.len());
     }
     
@@ -115,7 +117,8 @@ fn main() -> io::Result<()> {
     assert!(devsize > 0);
 
     
-    let pages = (devsize*512) / pagesize as u128;
+    let pages = (devsize*512) / pagesize as u32;
+    let lastpage = pages - 1;
 
     assert!(pages > 0);
     debug_assert_eq!(pages, ((devsize*512)/4096));
@@ -147,7 +150,7 @@ fn main() -> io::Result<()> {
     unsafe {
         (*swap_hdr).version = SWAP_VERSION;
 
-        (*swap_hdr).last_page = pages as u64- 1; //overflow?
+        (*swap_hdr).last_page = lastpage as u32; //overflow?
         /* One possibility is that last_page evaluates as 0 and swapon reads it
          * (swapon gets the size from casting the header pointer to a swap_header
          *  struct and reading from it), multiplies last_page+1 by the pagesize, which results in 0+1*4096 = 4096*/
@@ -155,8 +158,13 @@ fn main() -> io::Result<()> {
 
         (*swap_hdr).uuid = *Uuid::new_v4().as_bytes();
         
+
+        println!("\nswap_hdr: {:p}\nversion: {:p}\nlast_page: {}, {:p}\nuuid: {:?}, {:p}\n", 
+        &(*swap_hdr), &(*swap_hdr).version, (*swap_hdr).last_page, &(*swap_hdr).last_page, (*swap_hdr).uuid, &(*swap_hdr).uuid );
+
+        
     }
-    
+        
     /* Swap signature */
     let mut pos = 0;
     while pos < SWAP_SIGNATURE.len() {
@@ -172,8 +180,16 @@ fn main() -> io::Result<()> {
     fd.flush()?;
     fd.sync_all()?;
 
-    println!("Setting up swapspace version 1, size = {}KiB", (((pages-1) * pagesize as u128) / 1024));
+    println!("Setting up swapspace version 1, size = {}KiB", (((pages-1) * pagesize as u32) / 1024));
 
     Ok(())
 }
 
+/*
+    let ainitbuf = unsafe {buf.assume_init()};
+    let (_, offsetbuf) = ainitbuf.split_at(1024);
+    fd.seek(io::SeekFrom::Start(1024))?;
+    fd.write_all(offsetbuf)?;
+    fd.flush()?;
+    fd.sync_all()?; 
+    */
