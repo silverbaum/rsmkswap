@@ -221,10 +221,8 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
         if sz <= 0 {
             sz = unsafe { sysconf(_SC_PAGE_SIZE) };
             if sz <= 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "Failed to determine page size, please check your system configuration"
-                        .to_string(),
                 ));
             }
         }
@@ -370,7 +368,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     run(&args[..]).map_err(|e| {
         eprintln!("{}", e);
-        std::io::Error::new(std::io::ErrorKind::Other, e)
+        std::io::Error::other(e)
     })?;
     Ok(())
 }
