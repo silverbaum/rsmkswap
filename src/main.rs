@@ -349,20 +349,78 @@ pub fn clapp() -> Command {
         )
 }
 
-pub fn run(args: &[String]) -> std::io::Result<()> {
+pub fn run(args: &[String]) -> Result<(), std::io::Error> {
     let matches = clapp().try_get_matches_from(args).map_err(|e| {
-        eprintln!("{}", e);
-        std::process::exit(e.exit_code());
-    }).unwrap();
+        eprintln!("Error parsing arguments: {}", e);
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+    })?;
 
     if let Err(e) = mkswap(&matches) {
-        eprintln!("rsmkswap: {}", e);
-        std::process::exit(1);
+        eprintln!("{}", e);
+        return Err(e);
     }
     Ok(())
 }
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    run(&args[..])
+    run(&args[..]).map_err(|e| {
+        eprintln!("{}", e);
+        std::io::Error::new(std::io::ErrorKind::Other, e)
+    })?;
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_args() {
+        let args = vec![
+            String::from("mkswap"),
+            String::from("swapfile_test"),
+            String::from("--label"),
+            String::from("test_swap"),
+            String::from("-F"),
+            String::from("--size"),
+            String::from("65535"),
+            String::from("--uuid"),
+            String::from("123e4567-e89b-12d3-a456-426614174000"),
+        ];
+        let result = run(&args);
+        assert!(result.is_ok());
+        //delete file after test
+        let _ = fs::remove_file("swapfile_test");
+    }
+
+    #[test]
+    fn test_invalid_device() {
+        let args = vec![String::from("mkswap"), String::from("/invalid/device")];
+        let result = run(&args);
+        assert!(result.is_err());
+    }
+
+
+    #[test]
+    fn test_without_args() {
+        let args = vec![String::from("mkswap")];
+        let result = run(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_with_invalid_uuid() {
+        let args = vec![
+            String::from("mkswap"),
+            String::from("/dev/sda1"),
+            String::from("--uuid"),
+            String::from("invalid-uuid"),
+        ];
+        let result = run(&args);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("Invalid UUID"));
+    }
+
 }
