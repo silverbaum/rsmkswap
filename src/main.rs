@@ -3,16 +3,14 @@
 use std::{
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
-    os::{
-        fd::AsRawFd, linux::fs::MetadataExt, unix::fs::FileTypeExt, unix::fs::PermissionsExt,
-    },
+    os::{fd::AsRawFd, linux::fs::MetadataExt, unix::fs::FileTypeExt, unix::fs::PermissionsExt},
     path::Path,
     str::FromStr,
 };
 
-use clap::{Arg, ArgAction, ArgMatches, Command, crate_version, crate_name};
+use clap::{Arg, ArgAction, ArgMatches, Command, crate_name, crate_version};
+use libc::{_SC_PAGE_SIZE, _SC_PAGESIZE, ioctl, lseek, read, sysconf};
 use linux_raw_sys::ioctl::BLKGETSIZE64;
-use libc::{ioctl, lseek, read, sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE};
 use uuid::Uuid;
 
 const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
@@ -111,7 +109,9 @@ unsafe fn write_signature_page(
     //let mut buf = Box::<[u8]>::new_uninit_slice(pagesize);
     //buf.as_mut_ptr().write_bytes(0, pagesize);
     let mut buf = vec![0u8; pagesize];
-    unsafe { buf.as_mut_ptr().write_bytes(0, pagesize); }
+    unsafe {
+        buf.as_mut_ptr().write_bytes(0, pagesize);
+    }
 
     //fill up swap header
     let swap_hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut SwapHeader) };
@@ -157,7 +157,7 @@ fn open_device(
             return Err(std::io::Error::other(format!(
                 "failed to open {}: {}",
                 device, e
-            )))
+            )));
         }
     };
 
@@ -181,7 +181,10 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
         std::process::exit(1);
     });
 
-    let label = args.get_one::<String>("label").map(|s| s.as_str()).unwrap_or("");
+    let label = args
+        .get_one::<String>("label")
+        .map(|s| s.as_str())
+        .unwrap_or("");
 
     let dev = Path::new(device.as_str());
     let devname = if let Some(str) = dev.file_name().unwrap().to_str() {
@@ -191,10 +194,12 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
     };
 
     let uuid = match args.get_one::<String>("uuid") {
-        Some(str) => Uuid::from_str(str).map_err(|e| std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Invalid UUID '{}': {}", str, e),
-        ))?,
+        Some(str) => Uuid::from_str(str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid UUID '{}': {}", str, e),
+            )
+        })?,
         None => Uuid::new_v4(),
     };
 
@@ -218,8 +223,8 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
             if sz <= 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "Failed to determine page size, please check your system configuration".to_string(
-                    )
+                    "Failed to determine page size, please check your system configuration"
+                        .to_string(),
                 ));
             }
         }
@@ -231,7 +236,7 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
     let devsize: u128 = if createflag {
         filesize as u128
     } else {
-        getsize(&fd, &stat, devname).map_err(|e| std::io::Error::other(e))?
+        getsize(&fd, &stat, devname).map_err(std::io::Error::other)?
     };
 
     let pages: u128 = devsize / pagesize;
@@ -290,7 +295,6 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
 
     Ok(())
 }
-
 
 pub fn clapp() -> Command {
     Command::new(crate_name!())
@@ -371,7 +375,6 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,7 +405,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-
     #[test]
     fn test_without_args() {
         let args = vec![String::from("mkswap")];
@@ -422,5 +424,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("Invalid UUID"));
     }
-
 }
