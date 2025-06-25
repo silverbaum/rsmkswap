@@ -1,8 +1,11 @@
 [package]
 name = "rsmkswap"
+description = "Set up a linux swap area"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5.40", features = ["cargo"] }
 libc = "0.2.171"
+linux-raw-sys = { version = "0.9.4", features = ["ioctl"] }
 uuid = { version = "1.16.0", features = ["v4"] }

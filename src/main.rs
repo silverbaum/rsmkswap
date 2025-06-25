@@ -1,131 +1,368 @@
 //SPDX-License-Identifier: MIT
+
 use std::{
-    env, fs, io::{self, BufRead, Write}, os::linux::fs::MetadataExt
-    };
-use libc::{sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE};
+    fs::{self, File, Metadata},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
+    os::{
+        fd::AsRawFd, linux::fs::MetadataExt, unix::fs::FileTypeExt, unix::fs::PermissionsExt,
+    },
+    path::Path,
+    str::FromStr,
+};
+
+use clap::{Arg, ArgAction, ArgMatches, Command, crate_version, crate_name};
+use linux_raw_sys::ioctl::BLKGETSIZE64;
+use libc::{ioctl, lseek, read, sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE};
 use uuid::Uuid;
 
-const SWAP_SIGNATURE: &[u8] = b"SWAPSPACE2";
+const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
 const SWAP_SIGNATURE_SZ: usize = 10;
-const SWAP_UUID_LENGTH: usize = 16;
 const SWAP_VERSION: u8 = 1;
+const MIN_SWAP_PAGES: u128 = 10;
 
-
-#[repr(C)] //to ensure proper order/alignment
+#[repr(C)]
 struct SwapHeader {
     bootbits: [u8; 1024],
     version: u8,
     last_page: u32,
     nr_badpages: u32,
-    uuid: [u8; SWAP_UUID_LENGTH],
+    uuid: [u8; 16],
     volume_name: [u8; 16],
     padding: [u32; 117],
-    badpages: [u32; 1]
+    badpages: [u32; 100],
 }
 
-
-fn main() -> io::Result<()> {
-
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2  || args.len() > 2 {
-        println!("Usage: {} device", args[0]);
-        return Ok(());
-    }
-
-    let devstr = format!("{}", args[1]);
-    let devname = devstr.strip_prefix("/dev/").unwrap_or(&devstr);
-
-    let dev = std::path::Path::new(devstr.as_str());
-    
-
-    let mut fd = fs::File::options().create(true)
-                                    .write(true)
-                                    .truncate(false)
-                                    .append(false)
-                                    .open(dev)?;
-
-    let stat = fd.metadata()?;
-
-    if stat.st_uid() != 0 {
-        println!("{}: {}: insecure file owner {}, fix with: chown 0:0 {}",
-            args[0], args[1], stat.st_uid(), args[1]);
-    }
-
+fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u128, std::io::Error> {
     let devsize: u128;
-  
-    /*For block devices, read block size from sys/class/block */
-    if stat.st_mode() == 25008 {
-        let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
+    /* for block devices, ioctl call with manual size reading as a backup method */
+    if stat.file_type().is_block_device() {
+        let mut sz: u128 = 0;
+        let err = unsafe { ioctl(fd.as_raw_fd(), BLKGETSIZE64 as u64, &mut sz) };
 
-        //horrendous but it may work, returns size in sectors
-        let reader = io::BufReader::new(f_size);
-        let vec: Vec<Result<u128, _>> = reader.lines().map(|v| v.unwrap().parse::<u128>()).collect::<Vec<Result<u128, _>>>();
-        devsize = vec[0].clone().unwrap();
-        
+        if sz == 0 || err < 0 {
+            let f_size = fs::File::open(format!("/sys/class/block/{}/size", devname))?;
+
+            let reader = BufReader::new(f_size);
+            let vec: Vec<Result<u128, _>> = reader
+                .lines()
+                .map(|v| v.unwrap().parse::<u128>())
+                .collect::<Vec<Result<u128, _>>>();
+            sz = vec[0].clone().unwrap_or(0);
+            devsize = sz * 512;
+        } else {
+            devsize = sz;
+        }
     } else {
-        devsize = (stat.st_size() as u128)/512;
-        assert_eq!(stat.st_size(), stat.len());
+        devsize = stat.st_size() as u128;
     }
-    
 
-    let mut pagesize: i64 =  unsafe {sysconf(_SC_PAGESIZE)};
-    if pagesize <= 0 {
-        pagesize = unsafe {sysconf(_SC_PAGE_SIZE)};
-        if pagesize <= 0 {
-            pagesize = stat.st_blksize() as i64;
-            if pagesize <= 0 {
-                pagesize = 4096;
+    Ok(devsize)
+}
+
+unsafe fn check_blocks(
+    file: &mut File,
+    pagesize: usize,
+    pages: u128,
+    verbose: bool,
+) -> Result<Vec<u32>, std::io::Error> {
+    let mut bad_pages: Vec<u32> = Vec::new();
+    let mut buffer = vec![0u8; pagesize];
+    let end = pagesize as u64 * pages as u64;
+
+    let fd = file.as_raw_fd();
+    let mut bytes: libc::ssize_t;
+
+    for current_page in 0..pages {
+        let offset = current_page as u64 * pagesize as u64;
+        if offset > end {
+            break;
+        }
+
+        unsafe {
+            if lseek(fd, offset as i64, libc::SEEK_SET) < 0 {
+                panic!("Failed to seek");
+            }
+
+            bytes = read(fd, buffer.as_mut_ptr() as *mut std::ffi::c_void, pagesize);
+            if bytes < 0 || bytes != pagesize as isize {
+                bad_pages.push(current_page as u32);
             }
         }
+        if bad_pages.len() >= 640 {
+            panic!("Too many bad pages detected: {}", bad_pages.len());
+        }
     }
-    
-    assert!(pagesize > 0);
-    assert!(devsize > 0);
-
-    let pages = (devsize*512) / pagesize as u128;
-    let lastpage = pages - 1;
-
-    if pages < 10 {
-        println!("swap space needs to be at least {}KiB",
-                10 * pagesize / 1024);
-        return Ok(());
+    if verbose {
+        println!("{} bad pages", bad_pages.len())
     }
+    file.seek(SeekFrom::Start(0))?;
 
-    assert!(pages > 0);
-    assert!(lastpage > 0);
-    debug_assert_eq!(pages, ((devsize*512)/4096));
+    Ok(bad_pages)
+}
 
-    
-    //allocate signature page
-    let mut buf = Box::<[u8]>::new_uninit_slice(pagesize as usize);
+unsafe fn write_signature_page(
+    pagesize: usize,
+    pages: u128,
+    uuid: Uuid,
+    label: &str,
+    badpages: &mut Vec<u32>,
+    verbose: bool,
+) -> Vec<u8> {
+    //let mut buf = Box::<[u8]>::new_uninit_slice(pagesize);
+    //buf.as_mut_ptr().write_bytes(0, pagesize);
+    let mut buf = vec![0u8; pagesize];
+    unsafe { buf.as_mut_ptr().write_bytes(0, pagesize); }
 
-    unsafe {
-        //initialize the page
-        buf.as_mut_ptr().write_bytes(0, pagesize as usize); 
-    
-
-        //fill up swap header identically to C
-        let swap_hdr = buf.as_mut_ptr() as *mut SwapHeader; 
-        (*swap_hdr).version = SWAP_VERSION;
-        (*swap_hdr).last_page = lastpage as u32;
-        (*swap_hdr).uuid = *Uuid::new_v4().as_bytes();
-    }
-        
-    /* Swap signature */
-    let mut pos = 0;
-    while pos < SWAP_SIGNATURE.len() {
-
-        let _ = buf[pos+(pagesize as usize-SWAP_SIGNATURE_SZ)].write(SWAP_SIGNATURE[pos]);
-        pos += 1;
+    //fill up swap header
+    let swap_hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut SwapHeader) };
+    swap_hdr.version = SWAP_VERSION;
+    swap_hdr.last_page = (pages - 1) as u32;
+    swap_hdr.nr_badpages = badpages.len() as u32;
+    swap_hdr.badpages[..badpages.len()].copy_from_slice(badpages.as_mut_slice());
+    if !uuid.is_nil() {
+        swap_hdr.uuid = *uuid.as_bytes();
     }
 
+    if !label.is_empty() {
+        let lb = label.as_bytes();
+        let lblen = lb.len().min(swap_hdr.volume_name.len());
+        swap_hdr.volume_name[..lblen].copy_from_slice(&lb[..lblen]);
 
-    let buf = unsafe {buf.assume_init()};
+        if lb.len() > swap_hdr.volume_name.len() && verbose {
+            println!("Label '{}' truncated", label);
+        }
+    }
+
+    buf
+}
+
+fn open_device(
+    device: &String,
+    dev: &Path,
+    createflag: bool,
+    filesize: u64,
+) -> Result<File, std::io::Error> {
+    let mut options = fs::OpenOptions::new();
+    let fd = match options
+        .create(false)
+        .create_new(createflag)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .append(false)
+        .open(dev)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "failed to open {}: {}",
+                device, e
+            )))
+        }
+    };
+
+    if createflag {
+        fd.set_permissions(fs::Permissions::from_mode(0o600))?;
+        fd.set_len(filesize)?;
+    }
+
+    Ok(fd)
+}
+
+pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
+    let verbose = args.get_flag("verbose");
+    let checkflag: bool = args.get_flag("check");
+    let createflag: bool = args.get_flag("file");
+    let filesize: u64 = *args.get_one::<u64>("filesize").unwrap_or(&0);
+
+    // CHECK DEVICE ARGUMENT, Make sure it is compatible with the file creation functionality
+    let device = args.get_one::<String>("device").unwrap_or_else(|| {
+        eprintln!("mkswap: missing required argument 'device'");
+        std::process::exit(1);
+    });
+
+    let label = args.get_one::<String>("label").map(|s| s.as_str()).unwrap_or("");
+
+    let dev = Path::new(device.as_str());
+    let devname = if let Some(str) = dev.file_name().unwrap().to_str() {
+        str
+    } else {
+        device.strip_prefix("/dev/").unwrap_or(device)
+    };
+
+    let uuid = match args.get_one::<String>("uuid") {
+        Some(str) => Uuid::from_str(str).map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid UUID '{}': {}", str, e),
+        ))?,
+        None => Uuid::new_v4(),
+    };
+
+    let mut fd = open_device(device, dev, createflag, filesize)?;
+
+    let stat = fd.metadata()?;
+    if stat.st_uid() != 0 {
+        println!(
+            "mkswap: {}: insecure file owner {}, fix with: chown 0:0 {}",
+            device,
+            stat.st_uid(),
+            device
+        );
+    }
+
+    let stblksize: u64 = stat.st_blksize();
+    let pagesize: u128 = if stblksize == 0 {
+        let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
+        if sz <= 0 {
+            sz = unsafe { sysconf(_SC_PAGE_SIZE) };
+            if sz <= 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to determine page size, please check your system configuration".to_string(
+                    )
+                ));
+            }
+        }
+        (sz as u64).into()
+    } else {
+        stblksize.into()
+    };
+
+    let devsize: u128 = if createflag {
+        filesize as u128
+    } else {
+        getsize(&fd, &stat, devname).map_err(|e| std::io::Error::other(e))?
+    };
+
+    let pages: u128 = devsize / pagesize;
+
+    if pages < MIN_SWAP_PAGES {
+        if createflag {
+            fs::remove_file(dev)?;
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Device {} is too small for a swap area, minimum size is {}KiB",
+                devname,
+                (MIN_SWAP_PAGES * pagesize) / 1024
+            ),
+        ));
+    }
+
+    let mut badpages = if checkflag {
+        unsafe { check_blocks(&mut fd, pagesize as usize, pages, verbose)? }
+    } else {
+        vec![0; 100]
+    };
+
+    // initialize and write swap header information to a buffer
+    let mut buf = unsafe {
+        write_signature_page(
+            pagesize as usize,
+            pages,
+            uuid,
+            label,
+            &mut badpages,
+            verbose,
+        )
+    };
+
+    //write swap signature to buffer
+    let _ = &buf[(pagesize as usize - SWAP_SIGNATURE_SZ)..pagesize as usize]
+        .copy_from_slice(SWAP_SIGNATURE);
+
     fd.write_all(&buf)?;
     fd.flush()?;
     fd.sync_all()?;
 
-    println!("Setting up swapspace version 1, size = {}KiB", (((pages-1) * pagesize as u128) / 1024));
+    println!(
+        "Setting up swapspace version 1, size = {}KiB\n{}{}, UUID={}",
+        (((pages - 1) * pagesize as u128) / 1024),
+        if label.is_empty() {
+            "No label"
+        } else {
+            "LABEL="
+        },
+        &label[..label.len().min(16)], //truncate given too long of a label.
+        uuid
+    );
 
     Ok(())
+}
+
+
+pub fn clapp() -> Command {
+    Command::new(crate_name!())
+        .version(crate_version!())
+        .about("Set up a Linux swap area")
+        .infer_long_args(true)
+        .arg(
+            Arg::new("device")
+                .required(true)
+                .action(ArgAction::Set)
+                .help("block device or swap file"),
+        )
+        .arg(
+            Arg::new("label")
+                .short('l')
+                .long("label")
+                .action(ArgAction::Set)
+                .help("set a label"),
+        )
+        .arg(
+            Arg::new("uuid")
+                .short('u')
+                .long("uuid")
+                .action(ArgAction::Set)
+                .help("set the UUID to use"),
+        )
+        .arg(
+            Arg::new("check")
+                .long("check")
+                .short('c')
+                .action(ArgAction::SetTrue)
+                .help("check the device for bad pages before writing to it"),
+        )
+        .arg(
+            Arg::new("file")
+                .short('F')
+                .long("file")
+                .action(ArgAction::SetTrue)
+                .help("create a swap file"),
+        )
+        .arg(
+            Arg::new("filesize")
+                .short('s')
+                .long("size")
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(u64))
+                .value_name("SIZE")
+                .help("size of the swap file in bytes"),
+        )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .action(ArgAction::SetTrue)
+                .help("verbose output"),
+        )
+}
+
+pub fn run(args: &[String]) -> std::io::Result<()> {
+    let matches = clapp().try_get_matches_from(args).map_err(|e| {
+        eprintln!("{}", e);
+        std::process::exit(e.exit_code());
+    }).unwrap();
+
+    if let Err(e) = mkswap(&matches) {
+        eprintln!("rsmkswap: {}", e);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    run(&args[..])
 }
