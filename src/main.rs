@@ -222,7 +222,7 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
             sz = unsafe { sysconf(_SC_PAGE_SIZE) };
             if sz <= 0 {
                 return Err(std::io::Error::other(
-                    "Failed to determine page size, please check your system configuration"
+                    "Failed to determine page size, please check your system configuration",
                 ));
             }
         }
@@ -421,5 +421,43 @@ mod tests {
         let result = run(&args);
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("Invalid UUID"));
+    }
+
+    #[test]
+    fn test_with_too_small_device() {
+        let args = vec![
+            String::from("mkswap"),
+            String::from("swapfile_too_small"),
+            String::from("--file"),
+            String::from("--size"),
+            String::from("1024"), // 1 KiB, too small for swap
+        ];
+        let result = run(&args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("is too small for a swap area")
+        );
+    }
+    #[test]
+    fn test_all_features() {
+        let args = vec![
+            String::from("mkswap"),
+            String::from("swapfile_valid_uuid"),
+            String::from("--file"),
+            String::from("--size"),
+            String::from("65536"), // 64 KiB, valid size for swap
+            String::from("--uuid"),
+            String::from("123e4567-e89b-12d3-a456-426614174000"),
+            String::from("--label"),
+            String::from("SWAPTEST"),
+            String::from("--verbose"),
+        ];
+        let result = run(&args);
+        assert!(result.is_ok());
+        let _ = fs::remove_file("swapfile_valid_uuid");
     }
 }
