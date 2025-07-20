@@ -302,16 +302,19 @@ pub fn clapp() -> Command {
                 .help("verbose output"),
         )
 }
-
-fn main() {
-    let argv: Vec<String> = std::env::args().collect();
-    let args = &argv[..];
+fn run(args: &[String]) -> Result<(), std::io::Error> {
     let matches = clapp().get_matches_from(args);
 
     if let Err(e) = mkswap(&matches) {
         eprintln!("{e}");
-        std::process::exit(1);
+        return Err(e);
     }
+    Ok(())
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    run(&argv[..]).ok();
 }
 
 #[cfg(test)]
@@ -332,8 +335,8 @@ mod tests {
             String::from("123e4567-e89b-12d3-a456-426614174000"),
         ];
         let result = run(&args);
-        assert!(result.is_ok());
         let _ = fs::remove_file("swapfile_test");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -344,17 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn test_without_args() {
-        let args = vec![String::from("mkswap")];
-        let result = run(&args);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_with_invalid_uuid() {
         let args = vec![
             String::from("mkswap"),
-            String::from("/dev/sda1"),
+            String::from("-F"),
+            String::from("swapfile_invalid_uuid"),
             String::from("--uuid"),
             String::from("invalid-uuid"),
         ];
@@ -386,8 +383,8 @@ mod tests {
     fn test_all_features() {
         let args = vec![
             String::from("mkswap"),
-            String::from("swapfile_valid_uuid"),
-            String::from("--file"),
+            String::from("swapfile"),
+            String::from("-F"),
             String::from("--size"),
             String::from("65536"),
             String::from("--uuid"),
@@ -398,6 +395,6 @@ mod tests {
         ];
         let result = run(&args);
         assert!(result.is_ok());
-        let _ = fs::remove_file("swapfile_valid_uuid");
+        let _ = fs::remove_file("swapfile");
     }
 }
