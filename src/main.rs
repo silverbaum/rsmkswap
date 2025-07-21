@@ -144,16 +144,14 @@ fn open_device(
     Ok(fd)
 }
 
-pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
+pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
     let verbose = args.get_flag("verbose");
     let createflag: bool = args.get_flag("file");
     let filesize: u64 = *args.get_one::<u64>("filesize").unwrap_or(&0);
 
-    // CHECK DEVICE ARGUMENT, Make sure it is compatible with the file creation functionality
-    let device = args.get_one::<String>("device").unwrap_or_else(|| {
-        eprintln!("mkswap: missing required argument 'device'");
-        std::process::exit(1);
-    });
+    let device = args
+        .get_one::<String>("device")
+        .expect("missing required argument device");
 
     let label = args
         .get_one::<String>("label")
@@ -161,10 +159,12 @@ pub fn mkswap(args: &ArgMatches) -> std::io::Result<()> {
         .unwrap_or("");
 
     let dev = Path::new(device.as_str());
-    let devname = if let Some(str) = dev.file_name().unwrap().to_str() {
-        str
-    } else {
-        device.strip_prefix("/dev/").unwrap_or(device)
+    let devname = {
+        if let Some(n) = dev.file_name().and_then(|o| o.to_str()) {
+            n
+        } else {
+            device.strip_prefix("/dev/").unwrap_or(device)
+        }
     };
 
     let uuid = match args.get_one::<String>("uuid") {
@@ -262,6 +262,7 @@ pub fn clapp() -> Command {
         .arg(
             Arg::new("device")
                 .action(ArgAction::Set)
+                .required(true)
                 .help("block device or swap file"),
         )
         .arg(
@@ -302,19 +303,18 @@ pub fn clapp() -> Command {
                 .help("verbose output"),
         )
 }
+
 fn run(args: &[String]) -> Result<(), std::io::Error> {
     let matches = clapp().get_matches_from(args);
-
-    if let Err(e) = mkswap(&matches) {
-        eprintln!("{e}");
-        return Err(e);
-    }
-    Ok(())
+    mkswap(&matches)
 }
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    run(&argv[..]).ok();
+    if let Err(e) = run(&argv[..]) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
