@@ -42,7 +42,7 @@ fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Er
         let err = unsafe { ioctl(fd.as_raw_fd(), BLKGETSIZE64 as u64, &mut sz) };
 
         if sz == 0 || err < 0 {
-            let f_size = fs::File::open(format!("/sys/class/block/{}/size", devname))?;
+            let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
 
             let reader = BufReader::new(f_size);
             let vec: Vec<Result<u64, _>> = reader
@@ -87,10 +87,7 @@ unsafe fn write_signature_page(
     }
 
     let label_buf = unsafe {
-        std::slice::from_raw_parts_mut(
-            header.volume_name.as_mut_ptr() as *mut u8,
-            SWAP_LABEL_LENGTH,
-        )
+        std::slice::from_raw_parts_mut(header.volume_name.as_mut_ptr(), SWAP_LABEL_LENGTH)
     };
     label_buf[..lblen].copy_from_slice(&label_bytes[..lblen]);
 
@@ -130,8 +127,7 @@ fn open_device(
         Ok(f) => f,
         Err(e) => {
             return Err(std::io::Error::other(format!(
-                "failed to open {}: {}",
-                device, e
+                "failed to open {device}: {e}",
             )));
         }
     };
