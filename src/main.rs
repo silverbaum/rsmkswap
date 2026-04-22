@@ -29,9 +29,24 @@ struct SwapHeader {
     last_page: u32,
     nr_badpages: u32,
     uuid: [c_uchar; 16],
-    volume_name: [u8; SWAP_LABEL_LENGTH],
+    volume_name: [c_uchar; SWAP_LABEL_LENGTH],
     padding: [u32; 117],
     badpages: [u32; 1],
+}
+
+fn getpagesize() -> Result<usize, std::io::Error> {
+    
+    let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
+    if sz < 512 {
+        sz = unsafe { sysconf(_SC_PAGE_SIZE) };
+    }
+    if sz <= 0 {
+        Err(std::io::Error::other(
+            "Failed to determine page size, please check your system configuration",
+        ))
+    } else {
+        Ok(sz as usize)
+    }
 }
 
 fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Error> {
@@ -61,37 +76,27 @@ fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Er
     Ok(devsize)
 }
 
-unsafe fn write_signature_page(
-    pagesize: usize,
-    pages: u64,
-    uuid: Uuid,
-    label: &str,
-    badpages: [u32; 1],
-    verbose: bool,
-) -> Vec<u8> {
-    let mut header = SwapHeader {
-        bootbits: [0; 1024],
-        version: SWAP_VERSION,
-        last_page: (pages - 1) as u32,
-        nr_badpages: 0, // Assumes no bad pages
-        uuid: *uuid.as_bytes(),
-        volume_name: [0; SWAP_LABEL_LENGTH],
-        padding: [0; 117],
-        badpages,
-    };
+unsafe fn write_signature_page(pagesize: usize, pages: u64, uuid: Uuid, label: &str, badpages: [u32; 1], verbose: bool) -> Vec<u8> {
+    let mut buf = vec![0u8; pagesize];
 
+    let mut volume_name = [0u8; SWAP_LABEL_LENGTH];
     let label_bytes = label.as_bytes();
     let lblen = label_bytes.len().min(SWAP_LABEL_LENGTH);
+    volume_name[..lblen].copy_from_slice(&label_bytes[..lblen]);
     if label.len() > SWAP_LABEL_LENGTH && verbose {
         eprintln!("swap label was truncated");
     }
 
-    let label_buf = unsafe {
-        std::slice::from_raw_parts_mut(header.volume_name.as_mut_ptr(), SWAP_LABEL_LENGTH)
+    let header = SwapHeader {
+        bootbits: [0; 1024],
+        version: SWAP_VERSION,
+        last_page: (pages - 1) as u32,
+        nr_badpages: 0,
+        uuid: *uuid.as_bytes(),
+        volume_name,
+        padding: [0u32; 117],
+        badpages,
     };
-    label_buf[..lblen].copy_from_slice(&label_bytes[..lblen]);
-
-    let mut buf = vec![0u8; pagesize];
 
     let header_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -99,11 +104,9 @@ unsafe fn write_signature_page(
             std::mem::size_of::<SwapHeader>(),
         )
     };
+    buf[..header_bytes.len()].copy_from_slice(header_bytes);
 
-    buf[0..header_bytes.len()].copy_from_slice(header_bytes);
-
-    let signature_offset = pagesize - SWAP_SIGNATURE.len();
-    buf[signature_offset..].copy_from_slice(SWAP_SIGNATURE);
+    buf[pagesize-SWAP_SIGNATURE_SZ..].copy_from_slice(SWAP_SIGNATURE);
 
     buf
 }
@@ -184,28 +187,15 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
             device
         );
     }
-
-    let pagesize: u64 = {
-        let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
-        if sz < 512 {
-            sz = unsafe { sysconf(_SC_PAGE_SIZE) };
-        }
-        if sz <= 0 {
-            return Err(std::io::Error::other(
-                "Failed to determine page size, please check your system configuration",
-            ));
-        } else {
-            sz as u64
-        }
-    };
-
+    
+    let pagesize = getpagesize()?;
     let devsize = if createflag {
         filesize
     } else {
-        getsize(&fd, &stat, devname).map_err(std::io::Error::other)? as u64
+        getsize(&fd, &stat, devname).map_err(std::io::Error::other)?
     };
 
-    let pages = devsize / pagesize;
+    let pages = devsize / pagesize as u64;
 
     if pages < MIN_SWAP_PAGES {
         if createflag {
@@ -216,24 +206,19 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
             format!(
                 "Device {} is too small for a swap area, minimum size is {}KiB",
                 devname,
-                (MIN_SWAP_PAGES * pagesize) / 1024
+                (MIN_SWAP_PAGES * pagesize as u64) / 1024
             ),
         ));
     }
 
     let badpages = [0u32; 1];
+    let buf = unsafe { write_signature_page(pagesize, pages, uuid, label, badpages, verbose) };
 
-    // initialize and write swap header information to a buffer
-    let mut buf =
-        unsafe { write_signature_page(pagesize as usize, pages, uuid, label, badpages, verbose) };
-
-    //write swap signature to buffer
-    let _ = &buf[(pagesize as usize - SWAP_SIGNATURE_SZ)..pagesize as usize]
-        .copy_from_slice(SWAP_SIGNATURE);
 
     fd.write_all(&buf)?;
     fd.flush()?;
     fd.sync_all()?;
+
 
     println!(
         "Setting up swapspace version 1, size = {}KiB\n{}{}, UUID={}",
@@ -263,7 +248,7 @@ pub fn clapp() -> Command {
         )
         .arg(
             Arg::new("label")
-                .short('l')
+                .short('L')
                 .long("label")
                 .action(ArgAction::Set)
                 .help("set a label"),
