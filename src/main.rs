@@ -35,7 +35,6 @@ struct SwapHeader {
 }
 
 fn getpagesize() -> Result<usize, std::io::Error> {
-    
     let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
     if sz < 512 {
         sz = unsafe { sysconf(_SC_PAGE_SIZE) };
@@ -76,7 +75,14 @@ fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Er
     Ok(devsize)
 }
 
-unsafe fn write_signature_page(pagesize: usize, pages: u64, uuid: Uuid, label: &str, badpages: [u32; 1], verbose: bool) -> Vec<u8> {
+unsafe fn write_signature_page(
+    pagesize: usize,
+    pages: u64,
+    uuid: Uuid,
+    label: &str,
+    badpages: [u32; 1],
+    verbose: bool,
+) -> Vec<u8> {
     let mut buf = vec![0u8; pagesize];
 
     let mut volume_name = [0u8; SWAP_LABEL_LENGTH];
@@ -106,7 +112,7 @@ unsafe fn write_signature_page(pagesize: usize, pages: u64, uuid: Uuid, label: &
     };
     buf[..header_bytes.len()].copy_from_slice(header_bytes);
 
-    buf[pagesize-SWAP_SIGNATURE_SZ..].copy_from_slice(SWAP_SIGNATURE);
+    buf[pagesize - SWAP_SIGNATURE_SZ..].copy_from_slice(SWAP_SIGNATURE);
 
     buf
 }
@@ -187,7 +193,7 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
             device
         );
     }
-    
+
     let pagesize = getpagesize()?;
     let devsize = if createflag {
         filesize
@@ -214,11 +220,9 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
     let badpages = [0u32; 1];
     let buf = unsafe { write_signature_page(pagesize, pages, uuid, label, badpages, verbose) };
 
-
     fd.write_all(&buf)?;
     fd.flush()?;
     fd.sync_all()?;
-
 
     println!(
         "Setting up swapspace version 1, size = {}KiB\n{}{}, UUID={}",
