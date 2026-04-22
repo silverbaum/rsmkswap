@@ -1,38 +1,24 @@
 //SPDX-License-Identifier: MIT
 
+mod swapheader;
+
 use std::{
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Write},
     os::{
-        fd::AsRawFd, linux::fs::MetadataExt, raw::c_char, raw::c_uchar, unix::fs::FileTypeExt,
-        unix::fs::PermissionsExt,
+        fd::AsRawFd,
+        linux::fs::MetadataExt,
+        unix::fs::{FileTypeExt, PermissionsExt},
     },
     path::Path,
     str::FromStr,
 };
+use swapheader::{MIN_SWAP_PAGES, SWAP_SIGNATURE, SWAP_SIGNATURE_SZ, SwapHeader, SwapHeaderError};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, crate_name, crate_version};
 use libc::{_SC_PAGE_SIZE, _SC_PAGESIZE, ioctl, sysconf};
 use linux_raw_sys::ioctl::BLKGETSIZE64;
 use uuid::Uuid;
-
-const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
-const SWAP_SIGNATURE_SZ: usize = 10;
-const SWAP_LABEL_LENGTH: usize = 16;
-const SWAP_VERSION: u32 = 1;
-const MIN_SWAP_PAGES: u64 = 10;
-
-#[repr(C)]
-struct SwapHeader {
-    bootbits: [c_char; 1024],
-    version: u32,
-    last_page: u32,
-    nr_badpages: u32,
-    uuid: [c_uchar; 16],
-    volume_name: [c_uchar; SWAP_LABEL_LENGTH],
-    padding: [u32; 117],
-    badpages: [u32; 1],
-}
 
 fn getpagesize() -> Result<usize, std::io::Error> {
     let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
@@ -77,32 +63,16 @@ fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Er
 
 unsafe fn write_signature_page(
     pagesize: usize,
-    pages: u64,
+    pages: u32,
     uuid: Uuid,
     label: &str,
-    badpages: [u32; 1],
-    verbose: bool,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SwapHeaderError> {
     let mut buf = vec![0u8; pagesize];
 
-    let mut volume_name = [0u8; SWAP_LABEL_LENGTH];
-    let label_bytes = label.as_bytes();
-    let lblen = label_bytes.len().min(SWAP_LABEL_LENGTH);
-    volume_name[..lblen].copy_from_slice(&label_bytes[..lblen]);
-    if label.len() > SWAP_LABEL_LENGTH && verbose {
-        eprintln!("swap label was truncated");
-    }
-
-    let header = SwapHeader {
-        bootbits: [0; 1024],
-        version: SWAP_VERSION,
-        last_page: (pages - 1) as u32,
-        nr_badpages: 0,
-        uuid: *uuid.as_bytes(),
-        volume_name,
-        padding: [0u32; 117],
-        badpages,
-    };
+    let header = SwapHeader::new()
+        .label(label.to_owned())?
+        .pages(pages)?
+        .uuid(uuid);
 
     let header_bytes = unsafe {
         std::slice::from_raw_parts(
@@ -114,7 +84,7 @@ unsafe fn write_signature_page(
 
     buf[pagesize - SWAP_SIGNATURE_SZ..].copy_from_slice(SWAP_SIGNATURE);
 
-    buf
+    Ok(buf)
 }
 
 fn open_device(
@@ -150,7 +120,7 @@ fn open_device(
 }
 
 pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
-    let verbose = args.get_flag("verbose");
+    //let verbose = args.get_flag("verbose"); //TODO
     let createflag: bool = args.get_flag("file");
     let filesize: u64 = *args.get_one::<u64>("filesize").unwrap_or(&0);
 
@@ -201,24 +171,33 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
         getsize(&fd, &stat, devname).map_err(std::io::Error::other)?
     };
 
-    let pages = devsize / pagesize as u64;
+    let pages = (devsize / pagesize as u64) as u32;
 
-    if pages < MIN_SWAP_PAGES {
-        if createflag {
-            fs::remove_file(dev)?;
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "Device {} is too small for a swap area, minimum size is {}KiB",
-                devname,
-                (MIN_SWAP_PAGES * pagesize as u64) / 1024
-            ),
-        ));
+    if pages < MIN_SWAP_PAGES && createflag {
+        fs::remove_file(dev)?;
     }
 
-    let badpages = [0u32; 1];
-    let buf = unsafe { write_signature_page(pagesize, pages, uuid, label, badpages, verbose) };
+    let buf = unsafe {
+        match write_signature_page(pagesize, pages, uuid, label) {
+            Ok(buffer) => buffer,
+            Err(SwapHeaderError::TooFewPages { pages: _ }) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Device {} is too small for a swap area, minimum size is {}KiB",
+                        devname,
+                        (MIN_SWAP_PAGES * pagesize as u32) / 1024
+                    ),
+                ));
+            }
+            Err(SwapHeaderError::TooLongLabel) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    SwapHeaderError::TooLongLabel,
+                ));
+            }
+        }
+    };
 
     fd.write_all(&buf)?;
     fd.flush()?;
@@ -226,7 +205,7 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
 
     println!(
         "Setting up swapspace version 1, size = {}KiB\n{}{}, UUID={}",
-        (((pages - 1) * pagesize as u64) / 1024),
+        (((pages - 1) as usize * pagesize) / 1024),
         if label.is_empty() {
             "No label"
         } else {
@@ -280,13 +259,15 @@ pub fn clapp() -> Command {
                 .value_name("SIZE")
                 .help("size of the swap file in bytes"),
         )
-        .arg(
-            Arg::new("verbose")
-                .short('v')
-                .long("verbose")
-                .action(ArgAction::SetTrue)
-                .help("verbose output"),
-        )
+    /*
+    .arg(
+        Arg::new("verbose")
+            .short('v')
+            .long("verbose")
+            .action(ArgAction::SetTrue)
+            .help("verbose output"),
+    )
+    */
 }
 
 fn run(args: &[String]) -> Result<(), std::io::Error> {
@@ -376,7 +357,6 @@ mod tests {
             String::from("123e4567-e89b-12d3-a456-426614174000"),
             String::from("--label"),
             String::from("SWAPTEST"),
-            String::from("--verbose"),
         ];
         let result = run(&args);
         assert!(result.is_ok());
