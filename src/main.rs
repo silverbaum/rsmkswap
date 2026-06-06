@@ -3,6 +3,7 @@
 mod swapheader;
 
 use std::{
+    ffi::c_void,
     fs::{self, File, Metadata},
     io::{BufRead, BufReader, Write},
     os::{
@@ -13,10 +14,10 @@ use std::{
     path::Path,
     str::FromStr,
 };
-use swapheader::{MIN_SWAP_PAGES, SWAP_SIGNATURE, SWAP_SIGNATURE_SZ, SwapHeader, SwapHeaderError};
+use swapheader::{MIN_SWAP_PAGES, MkswapError, SWAP_SIGNATURE, SWAP_SIGNATURE_SZ, SwapHeader};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, crate_name, crate_version};
-use libc::{_SC_PAGE_SIZE, _SC_PAGESIZE, ioctl, sysconf};
+use libc::{_SC_PAGE_SIZE, _SC_PAGESIZE, ioctl, pread, sysconf};
 use linux_raw_sys::ioctl::BLKGETSIZE64;
 use uuid::Uuid;
 
@@ -61,17 +62,39 @@ fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Er
     Ok(devsize)
 }
 
+fn check_device(fd: &File, pagesize: usize, pages: u32) -> Result<Vec<u32>, std::io::Error> {
+    let mut buf = vec![0u8; pagesize];
+    let mut badpages: Vec<u32> = Vec::new();
+    for page in 1..pages {
+        let bytes = unsafe {
+            pread(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut c_void,
+                pagesize,
+                page as i64 * pagesize as i64,
+            )
+        };
+        if bytes < pagesize as isize {
+            badpages.push(page);
+            eprintln!("bad page at index {page}");
+        }
+    }
+    Ok(badpages)
+}
+
 unsafe fn write_signature_page(
     pagesize: usize,
     pages: u32,
+    badpages: Vec<u32>,
     uuid: Uuid,
     label: &str,
-) -> Result<Vec<u8>, SwapHeaderError> {
+) -> Result<Vec<u8>, MkswapError> {
     let mut buf = vec![0u8; pagesize];
 
     let header = SwapHeader::new()
         .label(label.to_owned())?
         .pages(pages)?
+        .bad_pages(badpages, pagesize)?
         .uuid(uuid);
 
     let header_bytes = unsafe {
@@ -122,7 +145,21 @@ fn open_device(
 pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
     //let verbose = args.get_flag("verbose"); //TODO
     let createflag: bool = args.get_flag("file");
-    let filesize: u64 = *args.get_one::<u64>("filesize").unwrap_or(&0);
+    let checkflag: bool = args.get_flag("check");
+    let filesize: u64 = match args.get_one::<u64>("filesize") {
+        Some(fsz) => *fsz,
+        None => 0,
+    };
+    let pagesize: usize = match args.get_one::<usize>("pagesize") {
+        Some(psz) => {
+            if psz.is_power_of_two() {
+                *psz
+            } else {
+                return Err(std::io::Error::other("Pagesize must be power of two"));
+            }
+        }
+        None => getpagesize()?,
+    };
 
     let device = args
         .get_one::<String>("device")
@@ -164,7 +201,6 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
         );
     }
 
-    let pagesize = getpagesize()?;
     let devsize = if createflag {
         filesize
     } else {
@@ -177,10 +213,16 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
         fs::remove_file(dev)?;
     }
 
+    let badpages = if checkflag {
+        check_device(&fd, pagesize, pages)?
+    } else {
+        vec![0]
+    };
+
     let buf = unsafe {
-        match write_signature_page(pagesize, pages, uuid, label) {
+        match write_signature_page(pagesize, pages, badpages, uuid, label) {
             Ok(buffer) => buffer,
-            Err(SwapHeaderError::TooFewPages { pages: _ }) => {
+            Err(MkswapError::TooFewPages { pages: _ }) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
@@ -190,10 +232,22 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
                     ),
                 ));
             }
-            Err(SwapHeaderError::TooLongLabel) => {
+            Err(MkswapError::TooLongLabel) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    SwapHeaderError::TooLongLabel,
+                    MkswapError::TooLongLabel,
+                ));
+            }
+            Err(MkswapError::MaxBadPagesExceeded {
+                bad_pages,
+                max_badpages,
+            }) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    MkswapError::MaxBadPagesExceeded {
+                        bad_pages,
+                        max_badpages,
+                    },
                 ));
             }
         }
@@ -211,7 +265,7 @@ pub fn mkswap(args: &ArgMatches) -> Result<(), std::io::Error> {
         } else {
             "LABEL="
         },
-        &label[..label.len().min(16)], //truncate given too long of a label.
+        &label,
         uuid
     );
 
@@ -248,7 +302,15 @@ pub fn clapp() -> Command {
                 .short('F')
                 .long("file")
                 .action(ArgAction::SetTrue)
+                .requires("filesize")
                 .help("create a swap file"),
+        )
+        .arg(
+            Arg::new("check")
+                .short('c')
+                .long("check")
+                .action(ArgAction::SetTrue)
+                .help("check the swap device for bad pages"),
         )
         .arg(
             Arg::new("filesize")
@@ -257,7 +319,17 @@ pub fn clapp() -> Command {
                 .action(ArgAction::Set)
                 .value_parser(clap::value_parser!(u64))
                 .value_name("SIZE")
+                .requires("file")
                 .help("size of the swap file in bytes"),
+        )
+        .arg(
+            Arg::new("pagesize")
+                .short('P')
+                .long("pagesize")
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(usize))
+                .value_name("PAGESIZE")
+                .help("set the pagesize of the target"),
         )
     /*
     .arg(
@@ -286,6 +358,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swapheader::SWAP_LABEL_LENGTH;
 
     #[test]
     fn test_valid_args() {
@@ -313,17 +386,38 @@ mod tests {
     }
 
     #[test]
+    fn test_long_label() {
+        let args = vec![
+            String::from("mkswap"),
+            String::from("-F"),
+            String::from("swapfile_long_label"),
+            String::from("--size"),
+            String::from("65535"),
+            String::from("--label"),
+            String::from("WAAAYTOOLONGOFALABELFORASWAP"),
+        ];
+        let result = run(&args);
+        assert!(result.err().unwrap().to_string().contains(
+            format!("Label is too long, maximum size is {SWAP_LABEL_LENGTH} characters").as_str()
+        ));
+        let _ = fs::remove_file("swapfile_long_label");
+    }
+
+    #[test]
     fn test_with_invalid_uuid() {
         let args = vec![
             String::from("mkswap"),
             String::from("-F"),
             String::from("swapfile_invalid_uuid"),
+            String::from("--size"),
+            String::from("65535"),
             String::from("--uuid"),
             String::from("invalid-uuid"),
         ];
         let result = run(&args);
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("Invalid UUID"));
+        let _ = fs::remove_file("swapfile_invalid_uuid");
     }
 
     #[test]
@@ -344,6 +438,7 @@ mod tests {
                 .to_string()
                 .contains("is too small for a swap area")
         );
+        let _ = fs::remove_file("swapfile_too_small");
     }
     #[test]
     fn test_all_features() {
@@ -352,13 +447,15 @@ mod tests {
             String::from("swapfile"),
             String::from("-F"),
             String::from("--size"),
-            String::from("65536"),
+            String::from("65535"),
             String::from("--uuid"),
             String::from("123e4567-e89b-12d3-a456-426614174000"),
             String::from("--label"),
             String::from("SWAPTEST"),
+            String::from("--check"),
         ];
         let result = run(&args);
+        dbg!(&result);
         assert!(result.is_ok());
         let _ = fs::remove_file("swapfile");
     }
