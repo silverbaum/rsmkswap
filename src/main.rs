@@ -363,7 +363,7 @@ fn mkswap(matches: &ArgMatches) -> Result<(), MkswapError> {
         .get_one::<String>("label")
         .map_or("", String::as_str);
     if label.len() > SWAP_LABEL_LENGTH {
-        return Err(MkswapError::TooLongLabel.into());
+        return Err(MkswapError::TooLongLabel);
     }
 
     let endianness = match matches.get_one::<String>("endianness") {
@@ -415,7 +415,7 @@ fn mkswap(matches: &ArgMatches) -> Result<(), MkswapError> {
     let createflag = matches.get_flag("file");
     let filesize = *matches.get_one::<u64>("filesize").unwrap_or(&0);
     if createflag && filesize < min_swapsize {
-        return Err(MkswapError::SwapAreaTooSmall { min_swapsize }.into());
+        return Err(MkswapError::SwapAreaTooSmall { min_swapsize });
     }
 
     let mut fd = open_device(devpath, devname, createflag, filesize)?;
@@ -440,7 +440,7 @@ fn mkswap(matches: &ArgMatches) -> Result<(), MkswapError> {
 
     let swapsize = devsize.saturating_sub(offset);
     if swapsize < min_swapsize {
-        return Err(MkswapError::SwapAreaTooSmall { min_swapsize }.into());
+        return Err(MkswapError::SwapAreaTooSmall { min_swapsize });
     }
 
     let pages: u32 = ((devsize - offset) / pagesize as u64)
@@ -602,7 +602,7 @@ fn run(args: &[String]) -> Result<(), MkswapError> {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&argv) {
-        eprintln!("rsmkswap: error: {}", e.to_string());
+        eprintln!("rsmkswap: error: {}", e);
         std::process::exit(1);
     }
 }
