@@ -8,4 +8,5 @@ edition = "2024"
 clap = { version = "4.5.40", features = ["cargo"] }
 libc = "0.2.171"
 linux-raw-sys = { version = "0.9.4", features = ["ioctl"] }
+nix = { version = "0.31.3", features = ["fs"] }
 uuid = { version = "1.16.0", features = ["v4"] }
