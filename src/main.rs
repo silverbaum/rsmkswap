@@ -496,7 +496,7 @@ fn mkswap(matches: &ArgMatches) -> Result<(), MkswapError> {
         } else {
             "LABEL="
         },
-        &label,
+        label,
         uuid
     );
 
