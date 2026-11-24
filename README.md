@@ -8,3 +8,6 @@ Tested on x86_64 GNU/Linux with ext4 and btrfs filesystems.
 ```
 rsmkswap -F -s 81920 swepfile --label SWEPFILE
 ```
+
+`--file` creates a new file and refuses existing paths, including symlinks. To
+format an existing swap file, omit `--file` and `--size`.
