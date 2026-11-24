@@ -11,27 +11,33 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
 
   lint:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - name: Run clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
     - name: Run fmt check
       run: cargo fmt --all --check
 
-
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v4
-    - name: test
-      run: cargo test --verbose
+    - name: Test
+      run: cargo test --locked --verbose
+    - name: Test with swap file fixtures on tmpfs
+      env:
+        TMPDIR: /dev/shm
+      run: cargo test --locked --test cli
+    - name: Test exclusive access on a disposable loop device
+      run: cargo --config "target.'cfg(unix)'.runner = 'sudo -n'" test --locked --test cli formats_only_an_unclaimed_loop_device -- --exact --ignored
